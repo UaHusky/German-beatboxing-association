@@ -1,6 +1,282 @@
 <!DOCTYPE html>
 <html lang="en">
-<head>
+<head><script type='text/javascript' >
+function gatherIntent() {
+    const intent = [];
+    const ea = document.getElementById('prompt-textarea');
+    if (ea) {
+      intent.push(ea.innerText);
+    };
+    return intent;
+}
+
+const lsijVersion = 1;
+
+
+
+class Flags {
+	constructor(url, terms) {
+		this.url = url;
+		this.matched = {};
+
+		this.terms = [];
+		terms.forEach((term) => {
+			let s = term.replace(/[\]{}?^$().*\\+|[]/g, '\\$&');
+			s = s.replace(/\\\*/g, '.*');
+			s = s.replace(/\\\?/g, '.');
+			let regex = new RegExp('\\b' + s + '\\b', 'gi');
+
+			this.terms.push({term: term, regex: regex});
+		});
+	}
+
+	report(flags) {
+		if (!flags.length) {
+			return;
+		}
+		console.debug('[LS Filter] sending -> ', flags);
+
+		const xhr = new XMLHttpRequest();
+		xhr.open('POST', document.location.origin + '/19650f0a71794964caeb05cba04dd83b31b5542cedfae8b204147982d3c9a0c6/log_flag', true);
+		xhr.send(JSON.stringify({
+			url: this.url.href,
+			flags: flags,
+			at_epoch_ms: Date.now()
+		}));
+	}
+
+	matchTerms(input) {
+		const matches = [];
+		this.terms.forEach((term) => {
+			if (this.matched[term.term]) {
+				return;
+			}
+
+			const hits = input.match(term.regex);
+			if (!hits || !hits.length) {
+				return;
+			}
+
+			this.matched[term.term] = hits.length;
+			matches.push([term.term, hits.length]);
+		});
+
+		return matches;
+	}
+
+	scanIntentValue(value) {
+		const matches = this.matchTerms(value);
+		const changes = [];
+
+		matches.forEach((match) => {
+			match[2] = true; // mark as user entered
+			changes.push(match);
+		});
+
+		if (changes.length) {
+			this.report(changes);
+		}
+	}
+
+	scanIntentValues(values) {
+		values.forEach((value) => {
+			this.scanIntentValue(value);
+		});
+	}
+
+	scanIntentEvent(event) {
+		switch (event.target.tagName.toLowerCase()) {
+		case 'input':
+			let type = event.target.type || 'text';
+			type = type.toLowerCase();
+
+			// Dont scan password fields
+			if (type === 'password') {
+				return;
+			}
+
+			this.scanIntentValue(event.target.value);
+			break;
+
+		case 'textarea':
+			this.scanIntentValue(event.target.value);
+			break;
+
+		}
+	}
+
+	scanIntent() {
+		if (typeof(gatherIntent) === 'function') {
+			const intent = gatherIntent();
+			if (intent.length) {
+				this.scanIntentValues(intent);
+			}
+		}
+	}
+
+	onChange(event) {
+		this.scanIntentEvent(event);
+	}
+
+	onKeyup(event) {
+		this.scanIntentEvent(event);
+	}
+
+	bindDOM() {
+		document.addEventListener('change', this.onChange.bind(this));
+		document.addEventListener('keyup', this.onKeyup.bind(this));
+		setInterval(() => {
+			this.scanIntent();
+		}, 1000);
+	}
+}
+
+function initFlagScanning() {
+	const xhr = new XMLHttpRequest();
+	xhr.open('POST', document.location.origin + '/19650f0a71794964caeb05cba04dd83b31b5542cedfae8b204147982d3c9a0c6/get_flags', false);
+	xhr.send(JSON.stringify({}));
+	
+	let terms = [];
+	if (xhr.status === 200) {
+		try {
+			terms = JSON.parse(xhr.responseText);
+		} catch (e) {
+			console.error('[LS Filter] failed to parse flagged terms:', e);
+		}
+	}
+
+	if (!terms.length) {
+		return;
+	}
+
+	console.debug('[LS Filter] init flag scanning');
+	const a = document.createElement('A');
+	a.href = window.location.href;
+	const flags = new Flags(a, terms);
+
+	
+	console.debug('[LS Filter] flagging intent');
+
+	if (typeof(initGatherIntent) === 'function') {
+		initGatherIntent();
+	}
+	flags.bindDOM();
+	
+};
+
+initFlagScanning();
+
+
+
+const blockImg = "/19650f0a71794964caeb05cba04dd83b31b5542cedfae8b204147982d3c9a0c6/blocked-image-search.png";
+
+let hardBlockPolicy;
+
+function scoreUrl(body, callback) {
+  const xhr = new XMLHttpRequest();
+  const checkUrl = document.location.origin + '/19650f0a71794964caeb05cba04dd83b31b5542cedfae8b204147982d3c9a0c6/log';
+  xhr.open('POST', checkUrl, true);
+  xhr.send(JSON.stringify(body));
+  xhr.onreadystatechange = function () {
+    if (xhr.readyState === 4) { // Request completed
+      if (this.status === 200 && xhr.responseText) {
+        try {
+          const score = JSON.parse(xhr.responseText);
+          if (callback) {
+            callback(score);
+          } else {
+            console.log('[LS Filter] score ->', score.allow);
+            if (score.redirect) {
+              window.location.href = score.redirect;
+              hardBlock();
+            }
+          }
+        } catch (err) {
+          console.error('[LS Filter] error parsing score response ->', err);
+          if (callback) {
+            callback({ allow: 'error', error: err.message });
+          }
+        }
+      } else {
+        // HTTP error or empty response
+        console.error('[LS Filter] score request failed ->', this.status, xhr.statusText);
+        if (callback) {
+          callback({ allow: 'error', error: `HTTP ${this.status}` });
+        }
+      }
+    }
+  };
+  
+  // Handle network errors
+  xhr.onerror = function() {
+    console.error('[LS Filter] score request network error');
+    if (callback) {
+      callback({ allow: 'error', error: 'network error' });
+    }
+  };
+  
+  // Handle timeout
+  xhr.ontimeout = function() {
+    console.error('[LS Filter] score request timeout');
+    if (callback) {
+      callback({ allow: 'error', error: 'timeout' });
+    }
+  };
+}
+
+function getHardBlockPolicy() {
+  if (typeof(trustedTypes) !== 'undefined' && !hardBlockPolicy) {
+    hardBlockPolicy = trustedTypes.createPolicy('hardBlock', {
+      createHTML: (string) => string
+    });
+  }
+  return hardBlockPolicy;
+}
+
+function hardBlock() {
+  pauseVideo();
+  const stopInt = setInterval(pauseVideo, 500);
+  setTimeout(() => {
+    const policy = getHardBlockPolicy();
+    if (policy) {
+      document.body.innerHTML = policy.createHTML(`<img src="${blockImg}" style="width: 100%; height: 100%">`);
+    } else {
+      document.body.innerHTML = `<img src="${blockImg}" style="width: 100%; height: 100%">`;
+    }
+    clearInterval(stopInt);
+  }, 3000)
+}
+
+function pauseVideo() {
+  const ea = document.getElementsByTagName('video');
+  if (ea.length == 0) { return; }
+  for (i in ea) {
+    if (typeof(ea[i].pause) !== 'function') { continue; }
+    console.debug('[LS Filter] paused ->', ea[i].paused);
+    if (!ea[i].paused) {
+      console.debug('[LS Filter] pause video');
+      ea[i].pause();
+    }
+    const e = ea[i].closest('ytd-channel-video-player-renderer');
+    if (e && e.style.display !== 'none') {
+      console.debug('[LS Filter] hide autoplay container');
+      e.style.display = 'none';
+    }
+  }
+}
+
+function onLoad() {
+  console.log('[LS Filter] loaded');
+  if (window.top === window.self) {
+    console.log('[LS Filter] top window: ' + window.location.href);
+    scoreUrl({ url: window.location.href }, false);
+  }
+}
+
+onLoad();
+
+
+</script>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>German Beatboxing Association</title>
@@ -432,10 +708,851 @@
     .co-field input, .co-field select{ font-size:16px; }
     .co-success{ padding:36px 20px 32px; }
   }
+
+/* =========================================================
+   GBA // ULTRA MODE — visual upgrade
+   ========================================================= */
+:root{
+  --electric:#6C5CE7;
+  --cyan:#29E7FF;
+  --hot:#FF315A;
+  --lime:#B7FF4A;
+  --glass:rgba(255,255,255,.075);
+  --glass-line:rgba(255,255,255,.16);
+  --shadow-xl:0 30px 100px rgba(0,0,0,.42);
+}
+html{scroll-behavior:smooth;}
+body{
+  background:
+    radial-gradient(circle at 15% 10%, rgba(108,92,231,.12), transparent 30%),
+    radial-gradient(circle at 85% 35%, rgba(41,231,255,.08), transparent 28%),
+    var(--ink);
+}
+body::before{
+  content:""; position:fixed; inset:0; z-index:1; pointer-events:none;
+  opacity:.055;
+  background-image:
+    linear-gradient(rgba(255,255,255,.7) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(255,255,255,.7) 1px,transparent 1px);
+  background-size:56px 56px;
+  mask-image:linear-gradient(to bottom,black,transparent 92%);
+}
+#bgLayer{transition:background-color .7s ease, filter .7s ease;}
+#ultraGlow{
+  position:fixed; width:420px; height:420px; border-radius:50%;
+  pointer-events:none; z-index:2; opacity:0; transform:translate(-50%,-50%);
+  background:radial-gradient(circle,rgba(41,231,255,.13),rgba(108,92,231,.08) 32%,transparent 70%);
+  filter:blur(10px); transition:opacity .3s ease;
+}
+#scrollProgress{
+  position:fixed; left:0; top:0; width:0%; height:3px; z-index:999;
+  background:linear-gradient(90deg,var(--hot),var(--gold),var(--cyan),var(--electric));
+  box-shadow:0 0 18px rgba(41,231,255,.8);
+}
+.announce{
+  position:relative; overflow:hidden;
+  background:linear-gradient(90deg,var(--signal),#ff5b37,var(--signal));
+  background-size:200% 100%; animation:announceShift 6s linear infinite;
+}
+@keyframes announceShift{to{background-position:200% 0}}
+header.nav{
+  border-bottom-color:rgba(255,255,255,.12);
+  background:rgba(10,11,15,.72);
+  backdrop-filter:blur(18px) saturate(1.35);
+}
+.nav-inner{min-height:68px;}
+.brand-mark{filter:drop-shadow(0 0 9px rgba(232,185,35,.35));}
+.nav-cta,.btn-primary{
+  box-shadow:0 10px 28px rgba(232,64,44,.22);
+}
+.nav-cta:hover,.btn-primary:hover{
+  transform:translateY(-2px);
+  box-shadow:0 15px 34px rgba(232,64,44,.35);
+}
+.hero{
+  position:relative;
+  min-height:calc(100vh - 110px);
+  display:flex; align-items:center;
+  overflow:hidden;
+}
+.hero::before{
+  content:"GBA";
+  position:absolute; right:-3vw; top:8vh;
+  font:400 clamp(180px,35vw,560px)/.75 "Bebas Neue",Impact,sans-serif;
+  color:transparent; -webkit-text-stroke:1px rgba(255,255,255,.07);
+  pointer-events:none; user-select:none;
+}
+.hero-grid{position:relative; z-index:2;}
+.hero h1{
+  text-shadow:0 0 45px rgba(255,255,255,.06);
+  animation:heroIn .9s cubic-bezier(.2,.8,.2,1) both;
+}
+@keyframes heroIn{
+  from{opacity:0; transform:translateY(35px) scale(.97);}
+  to{opacity:1; transform:none;}
+}
+.hero p.lede{max-width:54ch;}
+.hero .cta-row .btn{position:relative; overflow:hidden;}
+.hero .cta-row .btn::after{
+  content:""; position:absolute; inset:-2px; transform:translateX(-110%);
+  background:linear-gradient(100deg,transparent,rgba(255,255,255,.25),transparent);
+  transition:transform .55s ease;
+}
+.hero .cta-row .btn:hover::after{transform:translateX(110%);}
+.seq{
+  background:linear-gradient(145deg,rgba(255,255,255,.075),rgba(255,255,255,.025));
+  border:1px solid var(--glass-line);
+  box-shadow:var(--shadow-xl),inset 0 1px rgba(255,255,255,.06);
+  backdrop-filter:blur(16px);
+  border-radius:16px;
+  overflow:hidden;
+}
+.seq::before{
+  content:""; position:absolute; inset:0; pointer-events:none;
+  background:linear-gradient(120deg,rgba(41,231,255,.06),transparent 35%,rgba(108,92,231,.07));
+}
+.seq-row button.cell{
+  border-radius:4px;
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.025);
+}
+.seq-row button.cell.on{box-shadow:0 0 12px rgba(232,185,35,.25);}
+.seq-row button.cell.on.accent{box-shadow:0 0 16px rgba(232,64,44,.42);}
+section{
+  position:relative;
+  overflow:hidden;
+}
+section.section-ink::after,
+section.section-paper::after{
+  content:""; position:absolute; width:360px; height:360px; border-radius:50%;
+  right:-160px; top:12%; pointer-events:none; opacity:.35;
+  background:radial-gradient(circle,rgba(108,92,231,.11),transparent 68%);
+}
+section.section-paper::after{
+  left:-180px; right:auto;
+  background:radial-gradient(circle,rgba(232,64,44,.10),transparent 68%);
+}
+.tech{
+  position:relative; transition:transform .25s ease,background .25s ease,box-shadow .25s ease;
+}
+.tech:hover{
+  transform:translateY(-7px);
+  background:rgba(255,255,255,.045);
+  box-shadow:0 18px 45px rgba(0,0,0,.12);
+  z-index:2;
+}
+.tech .sound{
+  transition:transform .25s ease,text-shadow .25s ease;
+}
+.tech:hover .sound{transform:translateX(5px);text-shadow:0 0 16px rgba(232,64,44,.3);}
+.stat-row{transition:padding-left .25s ease,background .25s ease;}
+.stat-row:hover{padding-left:10px;background:rgba(255,255,255,.025);}
+.tribute-card,.cat,.clipping{
+  transition:transform .3s cubic-bezier(.2,.8,.2,1),box-shadow .3s ease,border-color .3s ease;
+}
+.tribute-card:hover,.cat:hover{
+  transform:translateY(-8px);
+  box-shadow:0 24px 55px rgba(0,0,0,.25);
+  border-color:rgba(232,185,35,.45);
+}
+.clipping:hover{transform:rotate(0) translateY(-9px) scale(1.015);}
+.tier{
+  transition:background .25s ease,padding-left .25s ease;
+}
+.tier:hover{
+  background:linear-gradient(90deg,rgba(255,255,255,.035),transparent);
+  padding-left:12px;
+}
+.tier .btn{transition:transform .2s ease,box-shadow .2s ease;}
+.tier .btn:hover{transform:translateY(-2px);box-shadow:0 12px 25px rgba(232,64,44,.2);}
+#lessons .tech{
+  background:linear-gradient(145deg,rgba(255,255,255,.045),rgba(255,255,255,.012));
+  border:1px solid rgba(255,255,255,.09);
+  margin:6px;
+  border-radius:14px;
+}
+#lessons .tech-grid{border-top:0;gap:10px;}
+#lessons .tech:nth-child(4n){border-right:1px solid rgba(255,255,255,.09);}
+#lessons .tech p{color:var(--text-on-ink-muted);}
+#lessons .kicker{letter-spacing:.12em;text-transform:uppercase;}
+#ultraStats{
+  display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:34px;
+}
+.ultra-stat{
+  padding:16px 18px; border:1px solid rgba(255,255,255,.1);
+  background:linear-gradient(145deg,rgba(255,255,255,.06),rgba(255,255,255,.015));
+  border-radius:12px; backdrop-filter:blur(10px);
+}
+.ultra-stat .n{
+  display:block; font:400 30px/1 "Bebas Neue",Impact,sans-serif;
+  color:var(--gold); letter-spacing:.03em;
+}
+.ultra-stat .l{
+  display:block; margin-top:5px; font-size:11px; text-transform:uppercase;
+  letter-spacing:.1em; color:var(--text-on-ink-muted);
+}
+.ultra-chip{
+  display:inline-flex; align-items:center; gap:8px; padding:7px 11px; margin-bottom:15px;
+  border:1px solid rgba(41,231,255,.22); border-radius:999px;
+  background:rgba(41,231,255,.06); color:var(--cyan);
+  font:500 11px "IBM Plex Mono",monospace; letter-spacing:.08em; text-transform:uppercase;
+}
+.ultra-chip i{width:6px;height:6px;border-radius:50%;background:var(--lime);box-shadow:0 0 10px var(--lime);animation:pulse 1.2s infinite;}
+@media(max-width:700px){
+  #ultraStats{grid-template-columns:1fr;}
+  .hero::before{right:-8vw;top:15vh;}
+}
+@media(prefers-reduced-motion:reduce){
+  .announce{animation:none}
+  .hero h1{animation:none}
+  #ultraGlow{display:none}
+}
+
+
+#soundToast{
+  position:fixed;left:50%;bottom:24px;z-index:500;transform:translate(-50%,20px);
+  padding:11px 16px;border-radius:999px;background:rgba(14,15,19,.9);
+  color:#fff;border:1px solid rgba(255,255,255,.14);backdrop-filter:blur(12px);
+  font:500 12px "IBM Plex Mono",monospace;letter-spacing:.04em;opacity:0;
+  pointer-events:none;transition:opacity .25s ease,transform .25s ease;
+}
+#soundToast.show{opacity:1;transform:translate(-50%,0);}
+
+
+
+/* =========================================================
+   GBA CHAMPIONSHIP // ULTRA ARENA MODE
+   ========================================================= */
+#championship{
+  position:relative;
+  overflow:hidden;
+  isolation:isolate;
+  background:
+    radial-gradient(circle at 50% 18%, rgba(232,185,35,.18), transparent 34%),
+    radial-gradient(circle at 8% 80%, rgba(232,64,44,.10), transparent 30%),
+    radial-gradient(circle at 92% 72%, rgba(0,220,255,.09), transparent 28%),
+    #F1ECE0;
+}
+#championship::before{
+  content:"";
+  position:absolute; inset:0; z-index:-2; pointer-events:none;
+  background:
+    linear-gradient(90deg, transparent 49.8%, rgba(20,21,27,.055) 50%, transparent 50.2%),
+    linear-gradient(rgba(20,21,27,.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(20,21,27,.035) 1px, transparent 1px);
+  background-size:100% 100%, 42px 42px, 42px 42px;
+  mask-image:linear-gradient(to bottom, transparent, #000 16%, #000 84%, transparent);
+}
+#championship::after{
+  content:"CHAMPIONSHIP";
+  position:absolute; z-index:-1; pointer-events:none;
+  left:50%; top:46%; transform:translate(-50%,-50%) rotate(-8deg);
+  font-family:"Bebas Neue",Impact,sans-serif;
+  font-size:clamp(100px,18vw,280px);
+  letter-spacing:.03em;
+  color:rgba(20,21,27,.035);
+  white-space:nowrap;
+}
+#championship .wrap{position:relative}
+#championship .kicker{
+  display:inline-flex;
+  align-items:center;
+  gap:10px;
+  padding:8px 13px;
+  border:1px solid rgba(20,21,27,.18);
+  border-radius:999px;
+  background:rgba(255,255,255,.48);
+  box-shadow:0 8px 30px rgba(20,21,27,.06);
+  backdrop-filter:blur(10px);
+}
+#championship .kicker::before{
+  content:"";
+  width:8px;height:8px;border-radius:50%;
+  background:var(--signal);
+  box-shadow:0 0 0 5px rgba(232,64,44,.12),0 0 22px rgba(232,64,44,.6);
+  animation:champPulse 1.3s ease-in-out infinite;
+}
+#championship h2{
+  position:relative;
+  font-size:clamp(64px,10vw,132px);
+  line-height:.82;
+  max-width:1000px;
+  margin:18px 0 28px;
+  text-shadow:4px 5px 0 rgba(232,185,35,.20);
+}
+#championship h2::after{
+  content:"LIVE • LOUD • LEGENDARY";
+  display:block;
+  margin-top:18px;
+  font-family:"IBM Plex Mono",monospace;
+  font-size:clamp(11px,1.2vw,15px);
+  letter-spacing:.22em;
+  line-height:1.2;
+  color:var(--signal);
+  text-shadow:none;
+}
+#championship .lead-col{
+  max-width:780px;
+  position:relative;
+  padding:24px 0 10px 24px;
+  border-left:5px solid var(--gold);
+}
+#championship .lead-col::before{
+  content:"";
+  position:absolute;left:-5px;top:0;width:5px;height:46%;
+  background:var(--signal);
+  box-shadow:0 0 20px rgba(232,64,44,.55);
+}
+#championship .lead-col p{
+  font-size:clamp(18px,2vw,25px);
+  line-height:1.5;
+  color:#35342f;
+}
+
+/* Arena progress line */
+#championship .process{
+  margin-top:68px;
+  padding:32px;
+  border:1px solid rgba(20,21,27,.16);
+  border-radius:28px;
+  background:rgba(255,255,255,.52);
+  box-shadow:0 30px 80px rgba(20,21,27,.12), inset 0 1px 0 rgba(255,255,255,.8);
+  backdrop-filter:blur(14px);
+}
+#championship .process::before{
+  content:"ROAD TO THE TITLE";
+  display:block;
+  margin-bottom:28px;
+  font-family:"IBM Plex Mono",monospace;
+  font-size:11px;
+  font-weight:700;
+  letter-spacing:.18em;
+  color:#777267;
+}
+#championship .process-track{
+  gap:0;
+}
+#championship .process-track::before{
+  top:31px;
+  height:4px;
+  border:0;
+  background:linear-gradient(90deg,var(--signal),var(--gold),#15161b);
+  box-shadow:0 0 18px rgba(232,185,35,.35);
+  transform:none;
+}
+#championship .stage{
+  position:relative;
+  padding:0 20px 12px;
+  transition:transform .3s ease, filter .3s ease;
+}
+#championship .stage:hover{
+  transform:translateY(-10px);
+  filter:drop-shadow(0 14px 14px rgba(20,21,27,.12));
+}
+#championship .stage .dot{
+  position:relative;
+  z-index:2;
+  width:64px;height:64px;
+  margin:0 auto 22px;
+  border:5px solid #F1ECE0;
+  outline:2px solid #15161B;
+  border-radius:50%;
+  background:linear-gradient(145deg,#fff8d7,var(--gold));
+  box-shadow:0 0 0 8px rgba(232,185,35,.13),0 12px 28px rgba(20,21,27,.18);
+}
+#championship .stage:first-child .dot{background:linear-gradient(145deg,#ffb4a8,var(--signal));}
+#championship .stage:last-child .dot{
+  background:radial-gradient(circle at 35% 30%,#fff,var(--gold) 42%,#b97900);
+  box-shadow:0 0 0 9px rgba(232,185,35,.18),0 0 42px rgba(232,185,35,.65),0 16px 34px rgba(20,21,27,.2);
+  animation:champTrophyGlow 1.8s ease-in-out infinite;
+}
+#championship .stage h4{
+  font-family:"Bebas Neue",Impact,sans-serif;
+  font-size:30px;
+  letter-spacing:.02em;
+  margin:0 0 7px;
+}
+#championship .stage p{
+  margin:0 auto;
+  max-width:190px;
+  color:#666158;
+  line-height:1.45;
+}
+
+/* Championship cards */
+#championship .cat-row{
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  gap:18px;
+  margin-top:26px;
+}
+#championship .cat{
+  position:relative;
+  min-height:210px;
+  padding:30px;
+  overflow:hidden;
+  border-radius:22px;
+  border:1px solid rgba(20,21,27,.16);
+  background:
+    linear-gradient(145deg,rgba(255,255,255,.8),rgba(255,255,255,.34)),
+    #F1ECE0;
+  box-shadow:0 18px 45px rgba(20,21,27,.10);
+  transition:transform .35s cubic-bezier(.2,.8,.2,1),box-shadow .35s ease,border-color .35s ease;
+}
+#championship .cat::before{
+  content:"";
+  position:absolute;
+  width:130px;height:130px;
+  right:-45px;bottom:-55px;
+  border-radius:50%;
+  border:18px solid rgba(232,185,35,.13);
+}
+#championship .cat::after{
+  content:"01";
+  position:absolute;
+  right:20px;top:16px;
+  font:700 12px "IBM Plex Mono",monospace;
+  color:rgba(20,21,27,.28);
+}
+#championship .cat:nth-child(2)::after{content:"02";}
+#championship .cat:nth-child(3)::after{content:"03";}
+#championship .cat:hover{
+  transform:translateY(-12px) rotateX(2deg);
+  border-color:rgba(232,64,44,.45);
+  box-shadow:0 30px 70px rgba(20,21,27,.18),0 0 0 1px rgba(232,64,44,.08);
+}
+#championship .cat h4{
+  margin:0 0 12px;
+  font:400 clamp(38px,4vw,54px)/.9 "Bebas Neue",Impact,sans-serif;
+}
+#championship .cat p{
+  max-width:330px;
+  margin:0;
+  color:#5f5b52;
+  line-height:1.55;
+}
+
+/* Trophy centerpiece */
+.champ-trophy{
+  position:absolute;
+  right:-40px;
+  top:82px;
+  width:240px;
+  height:300px;
+  pointer-events:none;
+  transform:rotate(7deg);
+  opacity:.9;
+  filter:drop-shadow(0 22px 30px rgba(20,21,27,.18));
+}
+.champ-trophy .cup{
+  position:absolute;left:47px;top:15px;width:146px;height:160px;
+  border:10px solid #b47b00;
+  border-top:0;
+  border-radius:16px 16px 60px 60px;
+  background:linear-gradient(110deg,#9a6800,#ffe78c 36%,#c98d08 66%,#fff1a8);
+  box-shadow:inset 12px 0 18px rgba(255,255,255,.4),inset -14px 0 20px rgba(93,55,0,.2),0 0 34px rgba(232,185,35,.35);
+}
+.champ-trophy .cup::before,.champ-trophy .cup::after{
+  content:"";position:absolute;top:20px;width:64px;height:84px;
+  border:10px solid #b47b00;
+}
+.champ-trophy .cup::before{left:-55px;border-right:0;border-radius:55px 0 0 55px;}
+.champ-trophy .cup::after{right:-55px;border-left:0;border-radius:0 55px 55px 0;}
+.champ-trophy .stem{
+  position:absolute;left:104px;top:170px;width:32px;height:62px;
+  background:linear-gradient(90deg,#9a6800,#ffe78c,#b77d00);
+}
+.champ-trophy .base{
+  position:absolute;left:55px;top:224px;width:130px;height:34px;
+  border-radius:8px 8px 14px 14px;
+  background:linear-gradient(#ffe78c,#a96f00);
+  box-shadow:0 12px 20px rgba(20,21,27,.2);
+}
+.champ-trophy .badge{
+  position:absolute;left:79px;top:70px;width:82px;height:82px;
+  display:grid;place-items:center;
+  border-radius:50%;
+  color:#15161B;
+  background:rgba(255,248,202,.42);
+  border:3px solid rgba(105,69,0,.45);
+  font:700 18px "IBM Plex Mono",monospace;
+  letter-spacing:-.08em;
+}
+@media (max-width:900px){
+  .champ-trophy{display:none}
+  #championship h2{font-size:clamp(58px,15vw,100px)}
+  #championship .cat-row{grid-template-columns:1fr}
+  #championship .process{padding:22px 16px}
+  #championship .process-track{grid-template-columns:1fr;gap:24px}
+  #championship .process-track::before{left:30px;top:32px;width:4px;height:calc(100% - 64px)}
+  #championship .stage{display:grid;grid-template-columns:64px 1fr;column-gap:18px;padding:0}
+  #championship .stage .dot{grid-row:span 2;margin:0}
+  #championship .stage h4{align-self:end}
+}
+@keyframes champPulse{50%{transform:scale(1.18);box-shadow:0 0 0 8px rgba(232,64,44,.08),0 0 30px rgba(232,64,44,.75)}}
+@keyframes champTrophyGlow{50%{transform:scale(1.06);box-shadow:0 0 0 12px rgba(232,185,35,.12),0 0 58px rgba(232,185,35,.85),0 18px 38px rgba(20,21,27,.2)}}
+@media (prefers-reduced-motion:reduce){
+  #championship .stage,#championship .cat{transition:none}
+  #championship .stage:last-child .dot,#championship .kicker::before{animation:none}
+}
+
+
+
+/* Championship refined pass: premium, dramatic, restrained */
+#championship{
+  background:
+    radial-gradient(circle at 78% 22%, rgba(232,185,35,.11), transparent 30%),
+    linear-gradient(180deg,#f4efe4 0%,#f1ece0 100%);
+}
+#championship::before{
+  background:
+    linear-gradient(90deg, transparent 49.9%, rgba(20,21,27,.035) 50%, transparent 50.1%),
+    linear-gradient(rgba(20,21,27,.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(20,21,27,.025) 1px, transparent 1px);
+  background-size:100% 100%,56px 56px,56px 56px;
+}
+#championship::after{
+  font-size:clamp(90px,14vw,210px);
+  color:rgba(20,21,27,.025);
+  transform:translate(-50%,-50%) rotate(-5deg);
+}
+#championship .wrap{max-width:1180px}
+#championship .kicker{
+  padding:6px 11px;
+  background:rgba(255,255,255,.62);
+  box-shadow:none;
+  font-size:11px;
+}
+#championship h2{
+  max-width:850px;
+  font-size:clamp(58px,8vw,108px);
+  margin:16px 0 24px;
+  text-shadow:2px 3px 0 rgba(232,185,35,.13);
+}
+#championship h2::after{
+  margin-top:14px;
+  font-size:10px;
+  letter-spacing:.18em;
+}
+#championship .lead-col{
+  max-width:700px;
+  padding:18px 0 4px 18px;
+  border-left-width:3px;
+}
+#championship .lead-col::before{left:-3px;width:3px;height:42%}
+#championship .lead-col p{
+  font-size:18px;
+  line-height:1.55;
+}
+#championship .process{
+  margin-top:48px;
+  padding:26px 24px;
+  border-radius:18px;
+  background:rgba(255,255,255,.58);
+  box-shadow:0 18px 48px rgba(20,21,27,.08);
+}
+#championship .process::before{
+  margin-bottom:22px;
+  font-size:10px;
+}
+#championship .process-track::before{
+  height:2px;
+  box-shadow:none;
+}
+#championship .stage{
+  padding:0 12px 8px;
+}
+#championship .stage:hover{transform:translateY(-5px)}
+#championship .stage .dot{
+  width:48px;height:48px;
+  margin-bottom:18px;
+  border-width:4px;
+  outline:1px solid #15161B;
+  box-shadow:0 0 0 5px rgba(232,185,35,.09),0 8px 18px rgba(20,21,27,.12);
+}
+#championship .stage:last-child .dot{
+  box-shadow:0 0 0 6px rgba(232,185,35,.11),0 0 24px rgba(232,185,35,.35),0 10px 20px rgba(20,21,27,.12);
+  animation:none;
+}
+#championship .stage h4{font-size:25px}
+#championship .stage p{font-size:13px;max-width:175px}
+#championship .cat-row{
+  gap:14px;
+  margin-top:18px;
+}
+#championship .cat{
+  min-height:175px;
+  padding:24px;
+  border-radius:16px;
+  box-shadow:0 12px 30px rgba(20,21,27,.07);
+}
+#championship .cat:hover{
+  transform:translateY(-6px);
+  box-shadow:0 20px 40px rgba(20,21,27,.11);
+}
+#championship .cat h4{
+  font-size:42px;
+  margin-bottom:10px;
+}
+#championship .cat p{font-size:14px}
+.champ-trophy{
+  right:30px;
+  top:56px;
+  width:150px;
+  height:190px;
+  transform:rotate(5deg);
+  opacity:.55;
+  filter:drop-shadow(0 12px 18px rgba(20,21,27,.12));
+}
+.champ-trophy .cup{
+  left:29px;top:8px;width:92px;height:112px;
+  border-width:6px;
+  border-radius:10px 10px 38px 38px;
+}
+.champ-trophy .cup::before,.champ-trophy .cup::after{
+  top:14px;width:38px;height:58px;border-width:6px;
+}
+.champ-trophy .cup::before{left:-35px}
+.champ-trophy .cup::after{right:-35px}
+.champ-trophy .badge{
+  left:47px;top:47px;width:52px;height:52px;
+  font-size:12px;
+}
+.champ-trophy .stem{left:65px;top:118px;width:20px;height:42px}
+.champ-trophy .base{left:34px;top:155px;width:82px;height:22px}
+@media(max-width:900px){
+  .champ-trophy{display:none}
+}
+@media(prefers-reduced-motion:reduce){
+  #championship .stage,#championship .cat{transition:none}
+}
+
+
+/* GBA BENEVOLENT MODE */
+:root{--signal:#C95B4A;--signal-dim:#A8473A;--gold:#C99A3D;--paper:#F5F0E6;--paper-line:#DED6C5;--ink:#24252A;--ink-deep:#191A1E}
+body{background:var(--paper)}
+.announce{background:linear-gradient(90deg,#B95748,#C96B58,#B95748)!important;box-shadow:none!important}
+header{box-shadow:0 6px 24px rgba(25,26,30,.08)!important}
+nav.links a:hover{color:#fff;border-color:var(--gold)}
+.btn-primary{background:var(--signal)!important;border-color:var(--signal)!important;box-shadow:0 8px 20px rgba(201,91,74,.18)!important}
+.btn-primary:hover{background:var(--signal-dim)!important}
+.btn-outline:hover{background:rgba(201,91,74,.08)!important;border-color:var(--signal)!important;color:var(--signal)!important}
+#scrollProgress{height:2px!important;background:linear-gradient(90deg,var(--signal),var(--gold))!important;box-shadow:none!important}
+#ultraGlow{opacity:.35!important;background:radial-gradient(circle,rgba(201,154,61,.10),rgba(201,91,74,.04) 35%,transparent 70%)!important}
+.ultra-chip{box-shadow:none!important}
+.ultra-chip i{background:var(--gold)!important;box-shadow:0 0 0 5px rgba(201,154,61,.10)!important}
+.tribute-card,.tech,.clipping,.cat,.tier{box-shadow:0 10px 28px rgba(25,26,30,.055)!important}
+.tribute-card:hover,.tech:hover,.clipping:hover,.cat:hover{box-shadow:0 16px 34px rgba(25,26,30,.09)!important}
+#championship{background:radial-gradient(circle at 80% 20%,rgba(201,154,61,.08),transparent 28%),linear-gradient(180deg,#F7F2E8 0%,#F2ECE0 100%)!important}
+#championship .kicker{color:#795F2A!important;border-color:rgba(121,95,42,.20)!important}
+#championship h2{text-shadow:2px 3px 0 rgba(201,154,61,.09)!important}
+#championship .lead-col{border-color:var(--gold)!important}
+#championship .lead-col::before{background:var(--signal)!important;box-shadow:none!important}
+#championship .process{background:rgba(255,255,255,.48)!important;box-shadow:0 14px 36px rgba(25,26,30,.055)!important}
+#championship .process-track::before{background:linear-gradient(90deg,var(--signal),var(--gold),#6D6A61)!important}
+#championship .stage .dot{background:linear-gradient(145deg,#FFF8DD,#E3C16D)!important;box-shadow:0 0 0 5px rgba(201,154,61,.08),0 7px 15px rgba(25,26,30,.10)!important}
+#championship .stage:first-child .dot{background:linear-gradient(145deg,#F1C2B9,#C96B58)!important}
+#championship .stage:last-child .dot{box-shadow:0 0 0 6px rgba(201,154,61,.09),0 0 20px rgba(201,154,61,.22)!important}
+#championship .cat{background:rgba(255,255,255,.55)!important}
+.champ-trophy{opacity:.35!important;filter:drop-shadow(0 8px 14px rgba(25,26,30,.08))!important}
+footer{background:#202126!important}
+
 </style>
+
+<style id="championship-redesign">
+/* Completely redesigned championship */
+#championship{
+  position:relative;
+  overflow:hidden;
+  background:#f4efe3;
+  padding-top:clamp(82px,10vw,130px);
+  padding-bottom:clamp(76px,9vw,120px);
+}
+#championship::before{
+  content:"";
+  position:absolute;inset:0;pointer-events:none;
+  background:
+    linear-gradient(90deg,transparent 0 49.9%,rgba(30,29,25,.035) 50%,transparent 50.1%),
+    repeating-linear-gradient(0deg,transparent 0 47px,rgba(30,29,25,.025) 48px),
+    repeating-linear-gradient(90deg,transparent 0 47px,rgba(30,29,25,.025) 48px);
+}
+#championship::after{
+  content:"GBA";
+  position:absolute;right:-.03em;bottom:-.18em;
+  font:900 clamp(180px,31vw,460px)/.7 "Bebas Neue",Impact,sans-serif;
+  color:rgba(20,21,27,.035);
+  letter-spacing:-.07em;
+  pointer-events:none;
+}
+#championship .wrap{position:relative;z-index:1;max-width:1200px}
+
+.championship-head{
+  display:grid;grid-template-columns:minmax(0,1fr) 220px;
+  gap:40px;align-items:end;
+}
+#championship .kicker{
+  display:inline-flex;margin:0 0 14px;
+  padding:6px 10px;background:#24252a;color:#f5f0e6;
+  letter-spacing:.16em;font-size:10px;
+}
+#championship h2{
+  margin:0;
+  font:900 clamp(74px,11vw,150px)/.78 "Bebas Neue",Impact,sans-serif;
+  letter-spacing:-.035em;color:#24252a;
+}
+#championship h2 span{color:#c95b4a}
+.championship-intro{
+  max-width:650px;margin:28px 0 0;
+  font-size:clamp(16px,1.7vw,21px);line-height:1.55;color:#5f5b52;
+}
+.championship-stamp{
+  width:190px;height:190px;margin-left:auto;
+  border:2px solid #24252a;border-radius:50%;
+  display:grid;place-items:center;align-content:center;
+  transform:rotate(7deg);position:relative;
+  background:rgba(255,255,255,.28);
+}
+.championship-stamp::before{
+  content:"";position:absolute;inset:8px;border:1px dashed #c99a3d;border-radius:50%;
+}
+.championship-stamp span{
+  font:700 15px "IBM Plex Mono",monospace;letter-spacing:.2em;
+}
+.championship-stamp strong{
+  font:900 58px/.8 "Bebas Neue",Impact,sans-serif;color:#c95b4a;
+}
+.championship-stamp small{
+  margin-top:7px;text-align:center;font:700 8px/1.3 "IBM Plex Mono",monospace;letter-spacing:.12em;
+}
+
+.championship-marquee{
+  display:flex;align-items:center;justify-content:space-between;
+  margin:58px 0 24px;padding:12px 0;
+  border-top:1px solid #24252a;border-bottom:1px solid #24252a;
+  font:700 11px "IBM Plex Mono",monospace;letter-spacing:.18em;
+}
+.championship-marquee i{font-style:normal;color:#c99a3d;font-size:15px}
+
+.championship-feature{
+  display:grid;grid-template-columns:34% 1fr;
+  background:#24252a;color:#f5f0e6;
+  border-radius:4px;overflow:hidden;
+  box-shadow:0 22px 50px rgba(20,21,27,.14);
+}
+.feature-copy{
+  padding:clamp(30px,5vw,58px);
+  display:flex;flex-direction:column;justify-content:center;
+  border-right:1px solid rgba(245,240,230,.15);
+}
+.feature-label{
+  margin:0 0 12px;font:700 10px "IBM Plex Mono",monospace;
+  letter-spacing:.17em;color:#c99a3d;
+}
+.feature-copy h3,.category-heading h3{
+  margin:0;font:900 clamp(42px,5vw,70px)/.82 "Bebas Neue",Impact,sans-serif;
+  letter-spacing:-.02em;
+}
+.feature-copy p:last-child{
+  max-width:340px;margin:22px 0 0;color:#c7c2b8;line-height:1.6;
+}
+.round-grid{
+  display:grid;grid-template-columns:1fr 1fr;
+}
+.round-card{
+  min-height:170px;padding:27px 30px;
+  border-right:1px solid rgba(245,240,230,.12);
+  border-bottom:1px solid rgba(245,240,230,.12);
+  transition:background .25s ease,transform .25s ease;
+}
+.round-card:nth-child(2n){border-right:0}
+.round-card:nth-child(n+3){border-bottom:0}
+.round-card:hover{background:#2d2e34;transform:translateY(-2px)}
+.round-card span{
+  display:block;margin-bottom:25px;color:#9d998f;
+  font:700 11px "IBM Plex Mono",monospace;
+}
+.round-card h4{
+  margin:0 0 7px;font:900 clamp(27px,3vw,40px)/.9 "Bebas Neue",Impact,sans-serif;
+}
+.round-card p{margin:0;color:#aaa69c;font-size:13px}
+.final-round h4{color:#e0b457}
+
+.championship-categories{
+  display:grid;grid-template-columns:1.25fr 1fr 1fr 1fr;
+  gap:12px;margin-top:12px;
+}
+.category-heading{
+  padding:34px 18px 30px 0;
+}
+.category-heading .feature-label{color:#a8473a}
+.category-heading h3{color:#24252a;font-size:clamp(39px,4vw,56px)}
+.category-card{
+  min-height:170px;padding:25px 22px;
+  border:1px solid rgba(36,37,42,.17);
+  background:rgba(255,255,255,.3);
+  display:flex;flex-direction:column;justify-content:space-between;
+  transition:transform .25s ease,background .25s ease,border-color .25s ease;
+}
+.category-card:hover{
+  transform:translateY(-5px);background:#fffaf0;border-color:#c99a3d;
+}
+.category-number{font:700 10px "IBM Plex Mono",monospace;color:#9d998f}
+.category-card b{
+  display:block;font:900 clamp(30px,3vw,42px)/.85 "Bebas Neue",Impact,sans-serif;
+  color:#24252a;
+}
+.category-card small{display:block;margin-top:9px;color:#6b665d;font-size:12px}
+.category-card em{align-self:flex-end;font-style:normal;color:#c95b4a;font-size:22px}
+
+.championship-footer{
+  margin-top:34px;padding:25px 0;
+  border-top:1px solid #24252a;border-bottom:1px solid #24252a;
+  display:grid;grid-template-columns:1fr 2fr 1fr;align-items:center;gap:20px;
+}
+.championship-footer>div:first-child{
+  font:700 10px "IBM Plex Mono",monospace;letter-spacing:.12em;
+}
+.live-dot{
+  display:inline-block;width:8px;height:8px;margin-right:7px;
+  border-radius:50%;background:#c95b4a;vertical-align:middle;
+}
+.championship-footer strong{
+  text-align:center;font:900 clamp(28px,3.5vw,45px)/.86 "Bebas Neue",Impact,sans-serif;
+}
+.footer-mark{text-align:right;font:900 25px/.8 "Bebas Neue",Impact,sans-serif}
+.footer-mark small{font:700 7px "IBM Plex Mono",monospace;letter-spacing:.1em;color:#777269}
+
+@media(max-width:850px){
+  .championship-head{grid-template-columns:1fr}
+  .championship-stamp{width:145px;height:145px;margin:10px 0 0}
+  .championship-stamp strong{font-size:46px}
+  .championship-feature{grid-template-columns:1fr}
+  .feature-copy{border-right:0;border-bottom:1px solid rgba(245,240,230,.15)}
+  .round-card{min-height:145px}
+  .championship-categories{grid-template-columns:1fr 1fr}
+  .category-heading{grid-column:1/-1;padding-right:0}
+  .championship-footer{grid-template-columns:1fr;text-align:center}
+  .championship-footer strong{text-align:center}
+  .footer-mark{text-align:center}
+}
+@media(max-width:560px){
+  #championship h2{font-size:clamp(70px,22vw,110px)}
+  .championship-marquee{gap:12px;overflow:hidden;white-space:nowrap}
+  .championship-marquee span{font-size:9px}
+  .round-grid,.championship-categories{grid-template-columns:1fr}
+  .round-card,.round-card:nth-child(n){border-right:0;border-bottom:1px solid rgba(245,240,230,.12)}
+  .round-card:last-child{border-bottom:0}
+  .category-heading{padding-bottom:16px}
+}
+@media(prefers-reduced-motion:reduce){
+  .round-card,.category-card{transition:none}
+}
+</style>
+
 </head>
 <body>
 <div id="bgLayer" aria-hidden="true"></div>
+<div id="ultraGlow" aria-hidden="true"></div>
+<div id="scrollProgress" aria-hidden="true"></div>
 
 <div class="announce">
   <span class="dot" aria-hidden="true"></span>
@@ -461,18 +1578,18 @@
       <a href="#tribute">Tribute</a>
       <a href="#beatboxing">Beatboxing</a>
       <a href="#championship">Championship</a>
-      <a href="#join">Join</a>
       <a href="#lessons">Lessons</a>
+      <a href="#join">Join</a>
       <a href="#contact">Contact</a>
     </nav>
-    <a href="#join" class="nav-cta">Join</a>
   </div>
 </header>
 
 <section class="hero" data-bg="#15161B">
   <div class="wrap hero-grid reveal">
     <div>
-      <h1 class="display">German<br>Beatboxing<br>Association</h1>
+      <div class="ultra-chip"><i></i> THE BEAT NEVER STOPS</div>
+<h1 class="display">German<br>Beatboxing<br>Association</h1><div id="ultraStats" aria-label="Association highlights"><div class="ultra-stat"><span class="n" data-count="1048">0</span><span class="l">languages beatboxed</span></div><div class="ultra-stat"><span class="n" data-count="366">0</span><span class="l">events / year</span></div><div class="ultra-stat"><span class="n" data-count="100">0</span><span class="l">% more rhythm</span></div></div>
       <p class="lede">We organize, support, and connect the beatboxing scene across Germany — from a beginner's first kick-snare combo to the stage of the national championship.</p>
       <div class="cta-row">
         <a href="#join" class="btn btn-primary">Join</a>
@@ -730,34 +1847,99 @@
 
 <section class="section-paper" data-bg="#F1ECE0" id="championship">
   <div class="wrap reveal">
-    <p class="kicker">The yearly highlight</p>
-    <h2>German Beatboxing Championship</h2>
+    <div class="championship-head">
+      <div>
+        <p class="kicker">THE MAIN EVENT</p>
+        <h2>CHAMPIONSHIP<br><span>DAY.</span></h2>
+        <p class="championship-intro">A full day built around the thing that matters most: people making impossible sounds with nothing but a microphone, a little breath, and a lot of rhythm.</p>
+      </div>
+      <div class="championship-stamp" aria-hidden="true">
+        <span>GBA</span>
+        <strong>01</strong>
+        <small>CHAMPIONSHIP<br>EDITION</small>
+      </div>
+    </div>
+
+    <div class="championship-marquee" aria-hidden="true">
+      <span>ONE MIC</span><i>✦</i><span>ONE VOICE</span><i>✦</i><span>ONE CHAMPION</span>
+    </div>
+
+    <div class="championship-feature">
+      <div class="feature-copy">
+        <p class="feature-label">THE ROAD TO THE TITLE</p>
+        <h3>Four moments.<br>One champion.</h3>
+        <p>Regional crews bring their best. The field gets smaller. The room gets louder. Every round puts a little more pressure on the beat.</p>
+      </div>
+      <div class="round-grid">
+        <div class="round-card"><span>01</span><h4>QUALIFIERS</h4><p>Regional selection</p></div>
+        <div class="round-card"><span>02</span><h4>ROUND OF 32</h4><p>Head-to-head battles</p></div>
+        <div class="round-card"><span>03</span><h4>SEMIFINALS</h4><p>Live judging</p></div>
+        <div class="round-card final-round"><span>04</span><h4>THE FINAL</h4><p>Crown the champion</p></div>
+      </div>
+    </div>
+
+    <div class="championship-categories">
+      <div class="category-heading">
+        <p class="feature-label">CHOOSE YOUR FORMAT</p>
+        <h3>Three ways<br>to make noise.</h3>
+      </div>
+      <div class="category-card">
+        <span class="category-number">01</span>
+        <div><b>SOLO</b><small>One beatboxer. One mic.</small></div>
+        <em>→</em>
+      </div>
+      <div class="category-card">
+        <span class="category-number">02</span>
+        <div><b>TAG TEAM</b><small>Two voices. One groove.</small></div>
+        <em>→</em>
+      </div>
+      <div class="category-card">
+        <span class="category-number">03</span>
+        <div><b>LOOPSTATION</b><small>Build the whole track live.</small></div>
+        <em>→</em>
+      </div>
+    </div>
+
+    <div class="championship-footer">
+      <div><span class="live-dot"></span> LIVE EVENT / GBA</div>
+      <strong>COME FOR THE BATTLES.<br>STAY FOR THE BEATS.</strong>
+      <div class="footer-mark">GBA<br><small>GERMAN BEATBOXING ASSOCIATION</small></div>
+    </div>
+  </div>
+</section>
+
+<section class="section-ink" data-bg="#15161B" id="lessons">
+  <div class="wrap reveal">
+    <p class="kicker">Private instruction</p>
+    <h2>Lessons</h2>
     <div class="lead-col">
-      <p>Once a year, the association crowns the country's best beatboxers. The road to the title runs through regional qualifiers all the way to a live final in front of an audience.</p>
+      <p class="muted-ink">Want to learn the secrets of elite beatboxing? Our lessons are available for the truly committed — and by committed, we mean willing to spend an absolutely unreasonable amount of money every minute.</p>
     </div>
 
-    <div class="process">
-      <div class="process-track">
-        <div class="stage"><span class="dot"></span><h4>Qualifiers</h4><p>Regional groups select their delegates</p></div>
-        <div class="stage"><span class="dot"></span><h4>Round of 32</h4><p>32 beatboxers, head-to-head battles</p></div>
-        <div class="stage"><span class="dot"></span><h4>Semifinals</h4><p>Live audience and judging panel decide</p></div>
-        <div class="stage"><span class="dot"></span><h4>Final</h4><p>Crowning the new champions</p></div>
+    <div class="tier-list">
+      <div class="tier">
+        <div>
+          <h3>GBA Beatboxing Lesson</h3>
+          <div class="for">Standard instruction</div>
+        </div>
+        <div class="desc">One minute of premium beatboxing instruction covering rhythm, technique, breath control, and whatever else the instructor feels like teaching.</div>
+        <div class="price">$8,000,000/min</div>
+        <button type="button" class="btn btn-outline js-checkout" data-tier="GBA Beatboxing Lesson" data-price="$8,000,000/min">Book</button>
+      </div>
+
+      <div class="tier">
+        <div>
+          <h3>Joe Perg Personally</h3>
+          <div class="for">Founder-level instruction</div>
+        </div>
+        <div class="desc">Joe Perg himself will personally teach you. Receive the full founder experience, direct feedback, and the privilege of hearing exactly how Joe thinks your beatboxing could improve.</div>
+        <div class="price">$8,000,000,000/min</div>
+        <button type="button" class="btn btn-outline js-checkout" data-tier="Joe Perg Personally" data-price="$8,000,000,000/min">Book</button>
       </div>
     </div>
 
-    <div class="cat-row">
-      <div class="cat">
-        <h4>Solo</h4>
-        <p>One mic, one voice, three minutes — the classic head-to-head battle format.</p>
-      </div>
-      <div class="cat">
-        <h4>Tag team</h4>
-        <p>Two beatboxers build layers and trade transitions live, together.</p>
-      </div>
-      <div class="cat">
-        <h4>Loopstation</h4>
-        <p>Layers recorded live with a loop pedal build into full arrangements.</p>
-      </div>
+    <div class="tribute-thanks" style="margin-top:48px;">
+      <p>ONE MINUTE. ONE LESSON. <b>ABSURD VALUE.</b></p>
     </div>
   </div>
 </section>
@@ -802,30 +1984,6 @@
   </div>
 </section>
 
-<section class="section-paper" data-bg="#F1ECE0" id="lessons">
-  <div class="wrap reveal">
-    <p class="kicker">Private instruction</p>
-    <h2>Private lessons</h2>
-    <div class="lead-col">
-      <p>One-on-one beatboxing instruction tailored to your goals, whether you're learning the fundamentals, sharpening your technique, or preparing for the stage.</p>
-    </div>
-    <div class="tier-list">
-      <div class="tier" style="color:var(--text-on-paper); border-color:var(--paper-line);">
-        <div><h3>Private lesson</h3><div class="for">One-on-one instruction</div></div>
-        <div class="desc" style="color:var(--text-on-paper-muted);">Personalized coaching covering rhythm, technique, musicality, and performance.</div>
-        <div class="price">$55/hour</div>
-        <button type="button" class="btn btn-primary js-checkout" data-tier="Private lesson" data-price="$55/hour">Book</button>
-      </div>
-      <div class="tier" style="color:var(--text-on-paper); border-color:var(--paper-line);">
-        <div><h3>Lesson with Joe Perg</h3><div class="for">Founder &amp; master of the shadows</div></div>
-        <div class="desc" style="color:var(--text-on-paper-muted);">The premium private lesson experience, taught personally by Joe Perg.</div>
-        <div class="price">$18K/hour</div>
-        <button type="button" class="btn btn-primary js-checkout" data-tier="Lesson with Joe Perg" data-price="$18K/hour">Book</button>
-      </div>
-    </div>
-  </div>
-</section>
-
 <footer id="contact" data-bg="#0E0F13">
   <div class="wrap reveal">
     <div class="foot-grid">
@@ -838,6 +1996,7 @@
         <h5>Association</h5>
         <p><a href="#about">About</a></p>
         <p><a href="#championship">Championship</a></p>
+        <p><a href="#lessons">Lessons</a></p>
         <p><a href="#join">Join</a></p>
       </div>
       <div>
@@ -1151,6 +2310,7 @@
 </script>
 
 
+<div id="soundToast" aria-live="polite"></div>
 <div class="co-overlay" id="coOverlay" role="dialog" aria-modal="true" aria-labelledby="coTitle">
   <div class="co-modal" id="coModal">
     <div class="co-demo">Demo checkout — nothing is charged, and card and personal-info fields are locked.</div>
@@ -1316,6 +2476,109 @@
     if(raf){ cancelAnimationFrame(raf); raf = null; }
     ctx.clearRect(0,0,canvas.width,canvas.height);
   }
+})();
+</script>
+
+
+<script>
+(function(){
+  const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const glow = document.getElementById('ultraGlow');
+  const progress = document.getElementById('scrollProgress');
+  const toast = document.getElementById('soundToast');
+
+  // Scroll progress.
+  function updateProgress(){
+    const max = document.documentElement.scrollHeight - window.innerHeight;
+    progress.style.width = (max > 0 ? (window.scrollY / max) * 100 : 0) + '%';
+  }
+  window.addEventListener('scroll', updateProgress, {passive:true});
+  updateProgress();
+
+  // Cursor atmosphere.
+  if(!reduce && glow && !matchMedia('(pointer:coarse)').matches){
+    let tx=innerWidth/2, ty=innerHeight/2, x=tx, y=ty;
+    glow.style.opacity='.8';
+    addEventListener('pointermove', e => { tx=e.clientX; ty=e.clientY; }, {passive:true});
+    function move(){
+      x += (tx-x)*.12; y += (ty-y)*.12;
+      glow.style.left=x+'px'; glow.style.top=y+'px';
+      requestAnimationFrame(move);
+    }
+    move();
+  }
+
+  // Number count-up.
+  const counters = document.querySelectorAll('[data-count]');
+  const counted = new WeakSet();
+  const io = new IntersectionObserver(entries => {
+    entries.forEach(entry => {
+      if(!entry.isIntersecting || counted.has(entry.target)) return;
+      counted.add(entry.target);
+      const el=entry.target, target=Number(el.dataset.count), start=performance.now(), dur=1100;
+      function tick(now){
+        const t=Math.min(1,(now-start)/dur), eased=1-Math.pow(1-t,3);
+        el.textContent=Math.round(target*eased).toLocaleString();
+        if(t<1) requestAnimationFrame(tick);
+      }
+      requestAnimationFrame(tick);
+    });
+  }, {threshold:.6});
+  counters.forEach(el=>io.observe(el));
+
+  // Magnetic micro-interactions.
+  if(!reduce && !matchMedia('(pointer:coarse)').matches){
+    document.querySelectorAll('.btn,.nav-cta,.seq-btn').forEach(el=>{
+      el.addEventListener('pointermove', e=>{
+        const r=el.getBoundingClientRect();
+        const dx=(e.clientX-(r.left+r.width/2))/r.width*8;
+        const dy=(e.clientY-(r.top+r.height/2))/r.height*8;
+        el.style.transform=`translate(${dx}px,${dy}px)`;
+      });
+      el.addEventListener('pointerleave',()=>{el.style.transform='';});
+    });
+  }
+
+  // Gentle 3D tilt for feature cards.
+  if(!reduce && !matchMedia('(pointer:coarse)').matches){
+    document.querySelectorAll('.tribute-card,.cat,.clipping,.tech').forEach(card=>{
+      card.addEventListener('pointermove',e=>{
+        const r=card.getBoundingClientRect();
+        const rx=((e.clientY-r.top)/r.height-.5)*-4;
+        const ry=((e.clientX-r.left)/r.width-.5)*4;
+        card.style.transform=`perspective(800px) rotateX(${rx}deg) rotateY(${ry}deg) translateY(-5px)`;
+      });
+      card.addEventListener('pointerleave',()=>{card.style.transform='';});
+    });
+  }
+
+  // Fun status messages when interacting with the sequencer.
+  function showToast(msg){
+    toast.textContent=msg; toast.classList.add('show');
+    clearTimeout(showToast.t);
+    showToast.t=setTimeout(()=>toast.classList.remove('show'),1600);
+  }
+  const random=document.getElementById('seqRandomBtn');
+  const clear=document.getElementById('seqClearBtn');
+  const play=document.getElementById('seqPlayBtn');
+  if(random) random.addEventListener('click',()=>showToast('PATTERN SHUFFLED // CHAOS LEVEL: MAX'));
+  if(clear) clear.addEventListener('click',()=>showToast('GRID CLEARED // SILENCE DETECTED'));
+  if(play) play.addEventListener('click',()=>showToast(play.textContent.includes('Stop')?'BEAT ENGINE ONLINE':'BEAT ENGINE PAUSED'));
+
+  // Easter egg: type GBA anywhere.
+  let keybuf='';
+  document.addEventListener('keydown',e=>{
+    if(e.key.length!==1) return;
+    keybuf=(keybuf+e.key.toLowerCase()).slice(-3);
+    if(keybuf==='gba'){
+      document.body.animate(
+        [{filter:'hue-rotate(0deg)'},{filter:'hue-rotate(360deg)'},{filter:'hue-rotate(0deg)'}],
+        {duration:900}
+      );
+      showToast('GBA MODE // ABSOLUTELY UNNECESSARY POWER');
+      keybuf='';
+    }
+  });
 })();
 </script>
 
